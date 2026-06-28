@@ -61,6 +61,7 @@ def load_all() -> dict:
         "recs": _load(OUT / "recommendations.json", []),
         "brief": _load(OUT / "briefing.json", {}),
         "sentiment": _load(OUT / "sentiment.json", {}),
+        "verification": _load(OUT / "verification.json", {}),
         "docs": _load(PROC / "clean.json", []),
         "chunks": _load(PROC / "chunks.json", []),
     }
@@ -74,6 +75,7 @@ industry = company_cfg.get("industry", "-")
 competitors = company_cfg.get("competitors", []) or []
 docs, intel = data["docs"], data["intel"]
 recs, brief, sent = data["recs"], data["brief"], data["sentiment"]
+verification = data["verification"]
 
 st.markdown(
     """<style>
@@ -161,25 +163,38 @@ h[3].metric("Net sentiment", ov.get("net_polarity", "-"))
 st.divider()
 
 if not docs:
-    st.warning("No data yet. Run `python -m pipeline.run_pipeline` first.")
+    st.warning("No data yet. Run `python -m pipeline.graph` first.")
 
-# ===== Strategic Advisor (interactive Q&A) =====
+# ===== Strategic Advisor (ReAct agent — Graph 2) =====
 if section == "Strategic Advisor":
     st.subheader("Strategic Advisor")
-    st.caption("Ask a strategic question; it is answered live from the knowledge base, "
-               "grounded in cited evidence.")
-    q = st.text_input("Your question",
-                      placeholder="e.g. Should we prioritise data-center GPUs over gaming?")
+    st.caption(
+        "Powered by the ReAct agent (Graph 2): the LLM autonomously decides which "
+        "tools to call — knowledge-base search, live news, sentiment, or metrics — "
+        "before producing a grounded answer."
+    )
+    q = st.text_input(
+        "Your question",
+        placeholder="e.g. Should NVIDIA prioritise data-centre GPUs over gaming this quarter?",
+    )
+
     if st.button("Ask", type="primary") and q.strip():
-        with st.spinner("Retrieving evidence and reasoning..."):
+        with st.spinner("Agent reasoning…"):
             try:
-                from src.agent.qa import ask_ceo
-                rcfg, emb, store, llm = _engines()
-                res = ask_ceo(rcfg, q.strip(), embedder=emb, store=store, llm=llm)
+                rcfg, emb, store, _ = _engines()
+                from src.agent.react_agent import run_react_agent
+                res = run_react_agent(q.strip(), cfg=rcfg, store=store, embedder=emb)
                 st.markdown(res["answer"] or "_No answer produced._")
-                render_evidence(res["evidence"])
+                if res.get("tool_trace"):
+                    with st.expander(f"Agent trace ({res['steps']} tool call(s))", expanded=False):
+                        for i, step in enumerate(res["tool_trace"], 1):
+                            inp = step.get("input", {})
+                            inp_str = next(iter(inp.values()), "") if inp else ""
+                            st.markdown(f"**Step {i}** — `{step['tool']}`")
+                            if inp_str:
+                                st.caption(f"Input: {inp_str}")
             except Exception as e:  # noqa: BLE001
-                st.error(f"Could not answer: {e}")
+                st.error(f"Agent error: {e}")
 
 # ===== Overview (Section 1: Company Overview) =====
 elif section == "Overview":
@@ -217,7 +232,7 @@ elif section == "Market Intelligence":
         for t in _mtr[:6]:
             st.markdown(f"- **{t.get('title','')}** {badge(t.get('direction'), 'direction')}")
     else:
-        st.caption("No trends yet — run the pipeline with an LLM available.")
+        st.caption("No trends yet — run `python -m pipeline.graph` with the LLM endpoint active.")
     st.subheader("Competitor activity")
     rows = [{"competitor": c,
              "mentions": sum(1 for d in docs
@@ -233,7 +248,7 @@ elif section == "Opportunities":
     opps = intel.get("opportunities", []) or []
     st.subheader(f"Opportunities ({len(opps)})")
     if not opps:
-        st.info("No opportunities yet — run the pipeline with an LLM available.")
+        st.info("No opportunities yet — run `python -m pipeline.graph` with the LLM endpoint active.")
     for o in opps:
         with st.container(border=True):
             st.markdown(f"#### {o.get('title','')}")
@@ -248,7 +263,7 @@ elif section == "Risks":
     risks = intel.get("risks", []) or []
     st.subheader(f"Risks ({len(risks)})")
     if not risks:
-        st.info("No risks yet — run the pipeline with an LLM available.")
+        st.info("No risks yet — run `python -m pipeline.graph` with the LLM endpoint active.")
     for r in risks:
         with st.container(border=True):
             st.markdown(f"#### {r.get('title','')}")
@@ -262,7 +277,7 @@ elif section == "Trends":
     trends = intel.get("trends", []) or []
     st.subheader(f"Trends ({len(trends)})")
     if not trends:
-        st.info("No trends yet — run the pipeline with an LLM available.")
+        st.info("No trends yet — run `python -m pipeline.graph` with the LLM endpoint active.")
     for t in trends:
         with st.container(border=True):
             st.markdown(f"#### {t.get('title','')}")
@@ -318,8 +333,25 @@ elif section == "Sentiment":
 # ===== Recommendations =====
 elif section == "Recommendations":
     st.subheader(f"Strategic recommendations ({len(recs)})")
+
+    # --- Verification report (Graph 1 verify node output) ---
+    if verification:
+        total = verification.get("total", 0)
+        passed = verification.get("passed", 0)
+        failed = verification.get("failed", 0)
+        vcols = st.columns(3)
+        vcols[0].metric("Total drafted", total)
+        vcols[1].metric("Passed validation", passed, delta=None)
+        vcols[2].metric("Rejected (< 3 evidence)", failed)
+        if failed and verification.get("rejected"):
+            with st.expander(f"{failed} rejected recommendation(s)", expanded=False):
+                for rej in verification["rejected"]:
+                    st.markdown(f"- **{rej.get('recommendation','')}**  \n"
+                                f"  _{rej.get('rejection_reason','')}_")
+        st.divider()
+
     if not recs:
-        st.info("No recommendations yet — run the pipeline with an LLM available.")
+        st.info("No recommendations yet — run `python -m pipeline.graph` with the LLM endpoint active.")
     order = {"high": 0, "medium": 1, "low": 2}
     for r in sorted(recs, key=lambda x: order.get(str(x.get("priority", "")).lower(), 3)):
         with st.container(border=True):

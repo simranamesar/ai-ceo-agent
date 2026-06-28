@@ -12,7 +12,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)  # .env always wins over stale shell exports
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "config" / "config.yaml"

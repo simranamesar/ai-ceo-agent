@@ -1,7 +1,13 @@
 """End-to-end pipeline: collect, clean, dedupe, chunk, embed, index, analyse,
 recommend, brief, and score sentiment.
 
-Run:  python -m pipeline.run_pipeline
+NOTE: pipeline/graph.py is now the primary entry point — it runs the same
+stages as a LangGraph StateGraph (with an explicit verify node and visible
+PipelineState). This file is kept as a fallback for environments where
+LangGraph is not installed.
+
+Preferred:  python -m pipeline.graph
+Fallback:   python -m pipeline.run_pipeline
 """
 from __future__ import annotations
 

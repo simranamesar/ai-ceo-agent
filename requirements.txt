@@ -16,6 +16,11 @@ chromadb
 # --- llm (OpenAI-compatible client -> Ollama / self-hosted vLLM/TGI) ---
 openai
 
+# --- agent framework (Graph 1 pipeline + Graph 2 ReAct loop) ---
+langgraph>=0.2
+langchain-core>=0.3
+langchain-openai>=0.2
+
 # --- dashboard ---
 streamlit
 plotly
