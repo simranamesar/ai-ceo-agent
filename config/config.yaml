@@ -1,0 +1,82 @@
+# ============================================================
+# AI CEO - Strategic Intelligence Agent  |  central config
+# ============================================================
+
+company:
+  name: "NVIDIA"
+  ticker: "NVDA"
+  industry: "Semiconductors / AI hardware"
+  aliases: ["NVIDIA", "Nvidia", "NVDA"]
+  competitors: ["AMD", "Intel", "Broadcom", "Google", "Cerebras", "Groq"]
+
+collection:
+  min_documents: 100
+  min_sources: 3
+  sources:
+
+    news:                     # SOURCE 1 - third-party news (keyless)
+      enabled: true
+      type: google_news
+      feeds:
+        - "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+      queries:
+        - "NVIDIA"
+        - "NVIDIA earnings"
+        - "NVIDIA AI chip"
+        - "NVIDIA data center"
+      max_per_query: 40
+
+    company:                  # SOURCE 2 - the company's own voice (keyless)
+      enabled: true
+      type: rss
+      feeds:
+        - "https://nvidianews.nvidia.com/rss.xml"
+        - "https://blogs.nvidia.com/feed/"
+      max_per_feed: 60
+
+    hackernews:               # SOURCE 3 - tech community (keyless)
+      enabled: true
+      type: hackernews
+      queries:
+        - "NVIDIA"
+        - "Nvidia GPU"
+        - "Nvidia CUDA"
+      max_per_query: 40
+
+processing:
+  chunk_size: 800             # characters
+  chunk_overlap: 120
+  min_chunk_chars: 100
+  near_dedup: true            # also drop near-duplicate docs (needs embeddings)
+  near_dup_threshold: 0.92    # cosine sim above which two docs are near-duplicates
+
+store:
+  backend: "chromadb"
+  persist_dir: "data/chroma"
+  collection_name: "company_intel"
+  embedding_model: "all-MiniLM-L6-v2"
+
+llm:
+  provider: "local"          # "ollama"/"vllm" (OpenAI endpoint) OR "local" (in-process transformers on GPU)
+  base_url_env: "LLM_BASE_URL"
+  model_env: "LLM_MODEL"
+  api_key_env: "LLM_API_KEY"
+  temperature: 0.2
+  max_tokens: 4096
+  no_think: true              # disable qwen reasoning mode
+
+intelligence:
+  top_k: 8
+  confidence_threshold: 0.5
+
+sentiment:
+  model: "cardiffnlp/twitter-roberta-base-sentiment-latest"  # RoBERTa 3-class sentiment
+  device: "cpu"               # keep the GPU free for the LLM
+  batch_size: 16
+  news_sources: ["news", "company"]      # official / press voice
+  public_sources: ["hackernews"]            # community voice
+
+paths:
+  raw: "data/raw"
+  processed: "data/processed"
+  outputs: "data/outputs"

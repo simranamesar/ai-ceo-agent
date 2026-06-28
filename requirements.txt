@@ -1,0 +1,22 @@
+# --- core ---
+pyyaml
+python-dotenv
+
+# --- data collection ---
+requests
+feedparser
+beautifulsoup4
+
+# --- processing & store ---
+sentence-transformers
+transformers          # sentiment classifier (encoder)
+accelerate            # required for device_map='auto' (local LLM on GPU)
+chromadb
+
+# --- llm (OpenAI-compatible client -> Ollama / self-hosted vLLM/TGI) ---
+openai
+
+# --- dashboard ---
+streamlit
+plotly
+pandas

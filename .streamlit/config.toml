@@ -1,0 +1,17 @@
+# Dashboard theme. To change the look, replace the [theme] block below with any
+# option from docs/THEMES.md, then restart Streamlit. base = "dark" | "light".
+[theme]
+base = "dark"
+primaryColor = "#F2A900"
+backgroundColor = "#0F1218"
+secondaryBackgroundColor = "#191E27"
+textColor = "#E6E9EF"
+font = "sans serif"
+
+# Server settings: silence the transformers file-watcher noise and make
+# the app work cleanly behind the cloudflared tunnel.
+[server]
+fileWatcherType = "none"
+headless = true
+enableCORS = false
+enableXsrfProtection = false
