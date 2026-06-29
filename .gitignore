@@ -8,3 +8,4 @@ data/raw/*.json
 data/processed/*.json
 data/outputs/*.json
 .DS_Store
+.deps_ok

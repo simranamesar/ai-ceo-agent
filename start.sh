@@ -19,9 +19,18 @@ if [ ! -d .venv ]; then
   pip install -r requirements.txt
   # pin the protobuf runtime so ChromaDB / OpenTelemetry stay on 5.x
   pip install --force-reinstall --no-deps "protobuf==5.29.5"
+  touch .deps_ok
 else
-  echo "[setup] reusing existing .venv"
   source .venv/bin/activate
+  # only reinstall if requirements.txt changed since last successful install
+  if [ ! -f .deps_ok ] || [ requirements.txt -nt .deps_ok ]; then
+    echo "[setup] requirements changed — installing missing packages ..."
+    pip install -r requirements.txt --quiet
+    pip install --force-reinstall --no-deps "protobuf==5.29.5" --quiet
+    touch .deps_ok
+  else
+    echo "[setup] packages up to date, skipping install"
+  fi
 fi
 python -c "import sys; print('venv:', sys.prefix)"                 # should end in /.venv
 python -c "import google.protobuf as p; print('protobuf', p.__version__)"

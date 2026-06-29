@@ -13,6 +13,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import time
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -150,6 +152,12 @@ with st.sidebar:
     if st.button("Reload data"):
         st.cache_data.clear()
         st.rerun()
+    auto_refresh = st.toggle("Auto-refresh", value=False)
+    if auto_refresh:
+        st.caption("Refreshing every 60 s")
+        time.sleep(60)
+        st.cache_data.clear()
+        st.rerun()
 
 # --- persistent header ---
 st.title(f"Strategic Intelligence — {company}")
@@ -169,7 +177,7 @@ if not docs:
 if section == "Strategic Advisor":
     st.subheader("Strategic Advisor")
     st.caption(
-        "Powered by the ReAct agent (Graph 2): the LLM autonomously decides which "
+        "The LLM autonomously decides which "
         "tools to call — knowledge-base search, live news, sentiment, or metrics — "
         "before producing a grounded answer."
     )
@@ -201,7 +209,7 @@ elif section == "Overview":
     st.subheader("Company overview")
     st.markdown(f"**Company:** {company}  ·  **Industry:** {industry}")
     _last = intel.get("generated_at", "")
-    _last_disp = _last.replace("T", " ")[:19] if _last else "not built yet"
+    _last_disp = _last.replace("T", " ")[:16] if _last else "not built yet"
     g = st.columns(3)
     g[0].metric("Documents collected", len(docs))
     g[1].metric("Data sources", len({d.get("source", "") for d in docs if d.get("source")}))
