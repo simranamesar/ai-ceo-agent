@@ -313,24 +313,55 @@ might keep calling tools.
 
 ---
 
-### 2.11 The Validation Gate
+### 2.11 The Two-Stage Validation Gate
 
 **What it is:** A Python function (`verify_recommendations`) that runs
 *after* the LLM generates recommendations and *before* they reach the
-dashboard.
+dashboard. It applies two independent checks.
 
-**Rule:** Any recommendation with fewer than 3 distinct evidence pieces
-(real cited articles) is rejected.
+**Stage 1 — Structural count:**
+Any recommendation with fewer than 3 distinct evidence pieces is rejected
+immediately. This ensures every recommendation is at least weakly grounded.
 
-**Why a Python gate, not a prompt instruction?**
-If you write "only recommend things with evidence" in the prompt, the LLM
-can (and sometimes will) ignore it, or fabricate evidence references. A
-Python function that counts the `evidence` list and drops the recommendation
-is a *guarantee*, not a request. The examiner can see exactly which
-recommendations were rejected and why.
+**Stage 2 — Semantic grounding (Sentence-BERT cosine):**
+Even if a recommendation has 3+ evidence pieces, it must actually relate
+to them semantically. The recommendation text (+ rationale) is embedded
+with the same `all-MiniLM-L6-v2` model and compared against every evidence
+title + snippet via cosine similarity. The maximum similarity across all
+evidence pieces is the **grounding score**.
+
+```
+grounding_score = max cosine_sim(embed(rec_text), embed(evidence_i))
+                  over all evidence pieces i
+```
+
+This is then blended with the retrieval confidence already attached to the
+finding:
+```
+blended_confidence = 0.5 × grounding_score + 0.5 × retrieval_confidence
+```
+
+If `blended_confidence < threshold (0.25)` the recommendation is rejected
+as semantically unsupported — the LLM wrote something that does not relate
+to the evidence it cited.
+
+**Why two stages?**
+- Stage 1 alone: the LLM could cite many irrelevant articles and pass.
+- Stage 2 alone: the LLM could write a rec that sounds like the evidence
+  but cites nothing and pass.
+- Together: the recommendation must have real citations AND be semantically
+  aligned with them.
+
+**What gets saved:**
+- `data/outputs/recommendations.json` — verified recs only (dashboard reads this)
+- `data/outputs/verification.json` — full report including rejected + rejection reason
+- `data/outputs/metrics.json` — `mean_confidence`, `factual_precision`, `threshold`
+
+`factual_precision = passed / total` — the fraction of LLM-generated recommendations
+that survived both validation stages.
 
 Located in `src/agent/verifier.py` → `verify_recommendations()`.
-Called as a node in Graph 1 (`verify_node` in `pipeline/graph.py`).
+Called by `verify_node` in `pipeline/graph.py`.
 
 ---
 
@@ -376,7 +407,33 @@ Keep document D if: ∀ already-kept K,  sim(D, K) < 0.92
 Drop document D if: ∃ already-kept K,  sim(D, K) ≥ 0.92
 ```
 
-### 3.4 Sentiment net polarity
+### 3.4 Semantic grounding score (verifier Stage 2)
+
+```
+grounding_score = max { A · B_i   for i = 1..N }
+
+where:
+  A   = embed(recommendation_text + rationale)          ∈ ℝ³⁸⁴
+  B_i = embed(evidence_title_i + evidence_snippet_i)    ∈ ℝ³⁸⁴
+  N   = number of evidence pieces
+
+(dot product = cosine similarity because all vectors are L2-normalised)
+
+blended_confidence = 0.5 × grounding_score + 0.5 × retrieval_confidence
+
+factual_precision  = passed / total_drafted     ∈ [0, 1]
+mean_confidence    = mean(blended_confidence)   across all recs
+```
+
+Example:
+- Recommendation: "Expand into Asian chip markets"
+- Evidence 1 title: "NVIDIA chip ban lifted in Asia"
+- Evidence 2 title: "Asia GPU demand surges 40%"
+- grounding_score = max(sim(rec, ev1), sim(rec, ev2)) ≈ 0.45
+- retrieval_confidence (from RAG distance) ≈ 0.85
+- blended = 0.5 × 0.45 + 0.5 × 0.85 = 0.65  →  passes threshold 0.25 ✅
+
+### 3.5 Sentiment net polarity
 
 ```
               positive − negative
@@ -540,9 +597,12 @@ src/intelligence/engine.py            src/intelligence/sentiment.py
 src/agent/ceo_agent.py → CEOAgent.recommend()   (LLM, cites O1/R2/T3 labels)
         │  draft recommendations
         ▼
-src/agent/verifier.py → verify_recommendations()  (Python gate: ≥ 3 evidence)
+src/agent/verifier.py → verify_recommendations()
+        │  Stage 1: len(evidence) >= 3
+        │  Stage 2: Sentence-BERT grounding score >= threshold
         │  saved: data/outputs/recommendations.json (verified only)
         │  saved: data/outputs/verification.json   (full report incl. rejected)
+        │  saved: data/outputs/metrics.json         (mean_confidence, factual_precision)
         ▼
 src/agent/briefing.py → generate_briefing()       (LLM)
         │  saved: data/outputs/briefing.json
@@ -691,6 +751,22 @@ description, and parameters) to the API. The LLM returns an `AIMessage` with a
 A prompt instruction is optional — the LLM can ignore it. A Python `if` statement
 is a guarantee. Rejected recommendations are saved with their rejection reason,
 making the gate auditable.
+
+**Q: What are the two validation stages?**
+Stage 1 (structural): `len(evidence) >= 3` — must cite at least 3 real articles.
+Stage 2 (semantic): `grounding_score = max cosine_sim(rec_text, evidence_i)` must
+reach the blended confidence threshold (0.25). A recommendation that cites irrelevant
+articles fails Stage 2 even if it passed Stage 1.
+
+**Q: What is factual_precision?**
+`passed / total_drafted` — the fraction of LLM-generated recommendations that
+survived both validation stages. Saved to `metrics.json` so the examiner can
+see a quantitative validation result.
+
+**Q: What is the grounding score?**
+Maximum cosine similarity between the embedded recommendation text and any embedded
+evidence piece (title + snippet). Uses the same L2-normalised MiniLM embeddings as
+the rest of the pipeline, so dot product = cosine similarity.
 
 **Q: What is net polarity?**
 `(positive_count − negative_count) / total_count`. Ranges −1 to +1. Zero means

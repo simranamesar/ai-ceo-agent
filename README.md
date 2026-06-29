@@ -152,7 +152,7 @@ A `StateGraph(PipelineState)` with 8 nodes in fixed linear order:
 4. **intelligence** — three RAG + LLM passes: opportunities / risks / trends.
 5. **sentiment** — RoBERTa labels each document; aggregated by source and time.
 6. **recommend** — CEO agent turns findings into prioritised strategic actions.
-7. **verify** — **validation gate**: each recommendation must cite ≥ 3 evidence pieces; failing ones are moved to `verification.json` and excluded from the dashboard.
+7. **verify** — **two-stage validation gate**: Stage 1 requires ≥ 3 cited evidence pieces; Stage 2 computes a Sentence-BERT cosine grounding score between the recommendation and its evidence — both must pass. Rejected recommendations are logged to `verification.json`; aggregate metrics (mean_confidence, factual_precision) go to `metrics.json`.
 8. **brief** — LLM produces the executive briefing (what happened / why / what next).
 
 ### Graph 2 — ReAct agent (`src/agent/react_agent.py`)
@@ -293,6 +293,6 @@ streamlit run dashboard/app.py
 | **Planning before execution** | Graph 1 `PipelineState` — plan is the node list |
 | **Autonomous decision-making** | Graph 2 `reason` node — LLM picks tools |
 | **Tool usage beyond the LLM** | `src/tools/registry.py` — 4 tools |
-| **Validation of recommendations** | Graph 1 `verify_node`, `src/agent/verifier.py` |
+| **Validation of recommendations** | Graph 1 `verify_node`, `src/agent/verifier.py` — Stage 1: evidence count ≥ 3; Stage 2: Sentence-BERT grounding score ≥ threshold |
 | Dashboard (9 sections) | `dashboard/app.py` |
 | Architecture documentation | this README + `docs/architecture.md` |

@@ -11,9 +11,8 @@ from __future__ import annotations
 import json
 import sys
 import tomllib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import time
 
 import pandas as pd
 import plotly.express as px
@@ -38,6 +37,18 @@ def _theme_base() -> str:
 
 
 PLOTLY_TMPL = "plotly_dark" if _theme_base() == "dark" else "plotly_white"
+_CEST = timezone(timedelta(hours=2))
+
+
+def _fmt_time(iso: str) -> str:
+    """Convert a UTC ISO timestamp to CEST (UTC+2), formatted as YYYY-MM-DD HH:MM."""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_CEST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso[:16]
 SENT_COLORS = {"positive": "#2BB673", "neutral": "#9AA0A6", "negative": "#E0524B"}
 
 
@@ -64,6 +75,7 @@ def load_all() -> dict:
         "brief": _load(OUT / "briefing.json", {}),
         "sentiment": _load(OUT / "sentiment.json", {}),
         "verification": _load(OUT / "verification.json", {}),
+        "metrics": _load(OUT / "metrics.json", {}),
         "docs": _load(PROC / "clean.json", []),
         "chunks": _load(PROC / "chunks.json", []),
     }
@@ -78,6 +90,7 @@ competitors = company_cfg.get("competitors", []) or []
 docs, intel = data["docs"], data["intel"]
 recs, brief, sent = data["recs"], data["brief"], data["sentiment"]
 verification = data["verification"]
+metrics = data["metrics"]
 
 st.markdown(
     """<style>
@@ -140,7 +153,7 @@ with st.sidebar:
     st.markdown(f"### {company}")
     st.caption(industry)
     if intel.get("generated_at"):
-        st.caption(f"Updated {intel['generated_at'][:10]}")
+        st.caption(f"Updated {_fmt_time(intel['generated_at'])}")
     st.divider()
     section = st.radio(
         "View",
@@ -152,12 +165,12 @@ with st.sidebar:
     if st.button("Reload data"):
         st.cache_data.clear()
         st.rerun()
-    auto_refresh = st.toggle("Auto-refresh", value=False)
-    if auto_refresh:
-        st.caption("Refreshing every 60 s")
-        time.sleep(60)
-        st.cache_data.clear()
-        st.rerun()
+    # auto_refresh = st.toggle("Auto-refresh", value=False)
+    # if auto_refresh:
+    #     st.caption("Refreshing every 60 s")
+    #     time.sleep(60)
+    #     st.cache_data.clear()
+    #     st.rerun()
 
 # --- persistent header ---
 st.title(f"Strategic Intelligence — {company}")
@@ -209,7 +222,7 @@ elif section == "Overview":
     st.subheader("Company overview")
     st.markdown(f"**Company:** {company}  ·  **Industry:** {industry}")
     _last = intel.get("generated_at", "")
-    _last_disp = _last.replace("T", " ")[:16] if _last else "not built yet"
+    _last_disp = _fmt_time(_last) if _last else "not built yet"
     g = st.columns(3)
     g[0].metric("Documents collected", len(docs))
     g[1].metric("Data sources", len({d.get("source", "") for d in docs if d.get("source")}))
@@ -342,19 +355,32 @@ elif section == "Sentiment":
 elif section == "Recommendations":
     st.subheader(f"Strategic recommendations ({len(recs)})")
 
-    # --- Verification report (Graph 1 verify node output) ---
+    # --- Verification report (two-stage gate output) ---
     if verification:
         total = verification.get("total", 0)
         passed = verification.get("passed", 0)
         failed = verification.get("failed", 0)
-        vcols = st.columns(3)
+        st.markdown("**Validation gate results**")
+        vcols = st.columns(5)
         vcols[0].metric("Total drafted", total)
-        vcols[1].metric("Passed validation", passed, delta=None)
-        vcols[2].metric("Rejected (< 3 evidence)", failed)
+        vcols[1].metric("Passed", passed)
+        vcols[2].metric("Rejected", failed)
+        vcols[3].metric("Mean confidence",
+                         f"{metrics.get('mean_confidence', 0):.2f}" if metrics else "—")
+        vcols[4].metric("Factual precision",
+                         f"{metrics.get('factual_precision', 0):.0%}" if metrics else "—")
+        if metrics:
+            st.caption(
+                f"Stage 1: ≥ {metrics.get('min_evidence', 3)} evidence pieces required  ·  "
+                f"Stage 2: blended confidence ≥ {metrics.get('threshold', 0.25):.2f} required "
+                f"(grounding score via Sentence-BERT cosine + retrieval confidence)"
+            )
         if failed and verification.get("rejected"):
             with st.expander(f"{failed} rejected recommendation(s)", expanded=False):
                 for rej in verification["rejected"]:
-                    st.markdown(f"- **{rej.get('recommendation','')}**  \n"
+                    gs = rej.get("grounding_score")
+                    gs_str = f"  ·  grounding={gs:.2f}" if gs is not None else ""
+                    st.markdown(f"- **{rej.get('recommendation','')}**{gs_str}  \n"
                                 f"  _{rej.get('rejection_reason','')}_")
         st.divider()
 
@@ -364,8 +390,10 @@ elif section == "Recommendations":
     for r in sorted(recs, key=lambda x: order.get(str(x.get("priority", "")).lower(), 3)):
         with st.container(border=True):
             st.markdown(f"#### {r.get('recommendation','')}")
+            gs = r.get("grounding_score")
+            gs_str = f"  ·  Grounding: **{gs:.2f}**" if gs is not None else ""
             st.markdown(f"Priority: {badge(r.get('priority'), 'priority')}  ·  "
-                        f"Risk: {badge(r.get('risk_level'), 'risk')}")
+                        f"Risk: {badge(r.get('risk_level'), 'risk')}{gs_str}")
             if r.get("rationale"):
                 st.write(f"**Rationale.** {r['rationale']}")
             if r.get("expected_impact"):

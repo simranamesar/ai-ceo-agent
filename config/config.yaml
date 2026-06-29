@@ -57,7 +57,7 @@ store:
   embedding_model: "all-MiniLM-L6-v2"
 
 llm:
-  provider: "local"          # "ollama"/"vllm" (OpenAI endpoint) OR "local" (in-process transformers on GPU)
+  provider: "ollama"          # "ollama"/"vllm" (OpenAI endpoint) OR "local" (in-process transformers on GPU)
   base_url_env: "LLM_BASE_URL"
   model_env: "LLM_MODEL"
   api_key_env: "LLM_API_KEY"
@@ -74,7 +74,11 @@ sentiment:
   device: "cpu"               # keep the GPU free for the LLM
   batch_size: 16
   news_sources: ["news", "company"]      # official / press voice
-  public_sources: ["hackernews"]            # community voice
+  public_sources: ["hackernews"]         # community voice
+
+verification:
+  min_evidence: 3             # Stage 1: minimum cited evidence pieces
+  confidence_threshold: 0.25  # Stage 2: blended (grounding + retrieval) score floor
 
 paths:
   raw: "data/raw"

@@ -11,6 +11,12 @@ Run:
 from __future__ import annotations
 
 import os
+
+# Must be set before any transformers/sentence-transformers import so the
+# TF Keras 3 compatibility error doesn't trigger in TF-heavy Docker environments.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -122,15 +128,24 @@ def recommend_node(state: PipelineState) -> dict:
 
 
 def verify_node(state: PipelineState) -> dict:
-    """Validation gate: drop recommendations with < 3 evidence pieces."""
+    """Two-stage validation gate: evidence count (Stage 1) + semantic grounding (Stage 2)."""
     print("== [Graph1] verify ==")
-    report = verify_recommendations(state["recommendations"])
-    # Write only the verified set to the dashboard artifact
-    save_json(report["verified"], os.path.join(state["cfg"]["paths"]["outputs"], "recommendations.json"))
-    save_json(report, os.path.join(state["cfg"]["paths"]["outputs"], "verification.json"))
+    cfg = state["cfg"]
+    threshold = cfg.get("verification", {}).get("confidence_threshold", 0.25)
+    report = verify_recommendations(
+        state["recommendations"],
+        embedder=state["embedder"],
+        threshold=threshold,
+    )
+    out = cfg["paths"]["outputs"]
+    save_json(report["verified"], os.path.join(out, "recommendations.json"))
+    save_json(report, os.path.join(out, "verification.json"))
+    save_json(report["metrics"], os.path.join(out, "metrics.json"))
+    m = report["metrics"]
     print(
-        f"[verify] {report['passed']}/{report['total']} passed "
-        f"({report['failed']} rejected for insufficient evidence)"
+        f"[verify] {report['passed']}/{report['total']} passed | "
+        f"mean_confidence={m['mean_confidence']} | "
+        f"factual_precision={m['factual_precision']}"
     )
     return {"recommendations": report["verified"], "verification": report}
 

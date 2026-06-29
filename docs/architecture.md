@@ -23,7 +23,7 @@ flowchart TD
         INTEL["intelligence · IntelligenceEngine (LLM + RAG)"]
         SENT["sentiment · SentimentAnalyzer (RoBERTa)"]
         REC["recommend · CEOAgent (LLM)"]
-        VER["verify · verifier.py  ← validation gate"]
+        VER["verify · verifier.py  ← Stage 1: count ≥ 3 evidence / Stage 2: Sentence-BERT grounding score"]
         BRF["brief · briefing.py (LLM)"]
         COL --> PROC --> IDX --> INTEL --> SENT --> REC --> VER --> BRF
     end
