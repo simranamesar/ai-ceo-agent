@@ -1018,13 +1018,50 @@ Two reasons:
 2. Demonstrating both encoder (understanding) and decoder (generation)
    architectures in one project shows that you understand when to use each.
 
-### Why Groq (free API) instead of a local model for the LLM?
+### What is Groq, and why was it used?
 
-The assignment says open models only — no paid API. Groq provides free hosting
-for open-source models (Qwen3, Llama 3) via an OpenAI-compatible endpoint.
-Running a 27B model locally would require a GPU the exam environment doesn't
-have. Groq makes the demo fast and reliable without paying for proprietary
-APIs like GPT-4.
+**What it is:** Groq (the company) is **not** a model — it's an AI
+infrastructure / inference provider. It builds custom chips called
+**LPUs (Language Processing Units)**: purpose-built ASICs for running LLM
+inference, as opposed to GPUs, which are general-purpose parallel
+processors originally designed for graphics and adapted for ML. An LPU's
+architecture is deterministic and built around very high on-chip SRAM
+bandwidth rather than off-chip HBM memory like a GPU — this removes most of
+the memory-fetch latency that slows down token-by-token autoregressive
+decoding, which is why Groq-hosted models generate tokens noticeably faster
+than typical GPU-hosted inference.
+
+On top of that hardware, Groq runs **GroqCloud**: a hosted API that serves
+open-weight models (Llama 3.x, Qwen, Mixtral, Gemma, DeepSeek, etc.) over
+an **OpenAI-compatible REST API** with a free developer tier. Groq doesn't
+train its own models — it hosts other organisations' open-weight models
+(e.g. Meta's Llama, Alibaba's Qwen) and serves them fast.
+
+**Why it was used here, specifically:**
+1. **Satisfies "open / freely accessible models only — no paid API."**
+   Groq's free tier hosts genuinely open-weight models (not a proprietary
+   model like GPT-4/Claude) at no cost, within the assignment's constraint.
+2. **OpenAI-compatible endpoint = zero code change.** Because `ChatOpenAI`
+   (from `langchain-openai`) and `LLMClient` (`src/llm/client.py`) already
+   speak the OpenAI chat-completions wire format, swapping the LLM provider
+   is just changing `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` env vars —
+   the same client code that talks to vLLM or Ollama also talks to Groq.
+3. **No GPU required.** The exam/demo environment has no GPU; Groq hosts
+   the model remotely, so the laptop only needs network access.
+4. **Inference speed matters for Graph 2 specifically.** The ReAct loop
+   (`reason ↔ act`) can make several LLM round trips per question (reason →
+   tool call → reason → tool call → final answer). Slow inference compounds
+   across each loop iteration; Groq's LPU hardware keeps a live multi-turn
+   demo responsive instead of visibly stalling between tool calls.
+5. **Reliability over self-hosting.** Standing up vLLM with GPU access is
+   the "production" path (also supported — see `README.md`), but for an
+   oral-exam demo a hosted, always-on endpoint with no local setup is less
+   likely to fail live.
+
+In short: Groq is the *inference layer* (hardware + hosting), not the model
+itself — the actual model running through it (e.g. `llama-3.3-70b-versatile`
+or a Qwen3 variant) is the open-weight model satisfying the assignment's
+model constraint; Groq is just how it's served fast and for free.
 
 ### Why not fine-tune the LLM?
 
@@ -1050,6 +1087,47 @@ story about NVIDIA earnings would appear 15 times with different titles,
 flooding the knowledge base and skewing retrieval toward the most syndicated
 story. A cosine threshold of 0.92 catches paraphrase while preserving genuinely
 different takes on the same event.
+
+### Why dense embeddings only — no BM25 / hybrid / keyword search?
+
+The system uses a single retriever: dense cosine similarity over MiniLM
+embeddings (`RagChain.retrieve()` in [src/agent/rag_chain.py](../src/agent/rag_chain.py)).
+There is no BM25, TF-IDF, or hybrid (sparse + dense, reciprocal-rank-fusion)
+stage anywhere in the codebase. This was a deliberate scope decision, not an
+oversight:
+
+1. **The queries here are conceptual, not lexical.** Questions like "what's
+   our biggest AI chip risk?" or building an "opportunities" finding need
+   *meaning* matches ("GPU shortage" ↔ "chip supply constraint"), which is
+   exactly what dense embeddings are for. BM25 wins when queries are exact
+   keyword/phrase lookups (ticker symbols, product codes, proper nouns) —
+   that's not the dominant query pattern in this project.
+2. **Corpus size doesn't justify it.** BM25's main advantage over dense
+   retrieval shows up at large scale or when exact-term precision matters
+   (legal/code search, product catalogues). This knowledge base is a few
+   hundred news/blog/HN documents — dense top-k retrieval already returns
+   strong, relevant evidence at this scale; the marginal benefit of adding a
+   second retriever and a fusion step is small.
+3. **Hybrid retrieval adds real engineering surface area for no assignment
+   credit.** A BM25+dense hybrid needs a second index (e.g. `rank_bm25`),
+   a fusion/reranking step, and tuning of the fusion weight — none of which
+   is part of the required agent behaviours (planning, autonomous decisions,
+   tool usage, retrieval/evidence, analysis, validation). Spending the
+   project's complexity budget there would trade off against the parts that
+   are actually graded.
+4. **It's a known, named limitation, not a hidden gap.** If asked directly
+   ("did you consider hybrid search?"), the honest answer is: yes, dense-only
+   was chosen because the use case is semantic, the corpus is small, and the
+   course requirement is "retrieval and use of evidence" — which a single
+   well-grounded dense retriever already satisfies (every finding cites real
+   chunk IDs and URLs; see [[the validation gate]] in section 2.11 for how
+   grounding is independently re-checked downstream).
+
+**If extending the project later:** the natural upgrade path is reciprocal
+rank fusion (RRF) of a BM25 index (`rank_bm25`) over chunk text with the
+existing ChromaDB dense results — RRF needs no score normalisation between
+the two retrievers, which is its main practical advantage over a hand-tuned
+weighted blend.
 
 ---
 
@@ -1089,6 +1167,23 @@ Because `MessagesState.messages` is `Annotated[list[BaseMessage], add_messages]`
 — its reducer appends rather than overwrites. `PipelineState` fields have no
 such annotation, so they use the default overwrite reducer instead (fine
 there, since Graph 1 is a strict linear chain with one writer per channel).
+
+**Q: What is Groq?**
+An AI inference provider, not a model. It builds custom LPU (Language
+Processing Unit) chips — deterministic, SRAM-bandwidth-optimised hardware
+purpose-built for fast LLM token generation, unlike general-purpose GPUs.
+GroqCloud hosts open-weight models (Llama, Qwen, etc.) behind a free,
+OpenAI-compatible API — used here because it's free, needs no local GPU,
+serves genuinely open models (satisfying the assignment's constraint), and
+is fast enough to keep the multi-turn ReAct loop responsive in a live demo.
+
+**Q: Is BM25 / keyword / hybrid search used anywhere?**
+No — retrieval is dense-embedding-only (cosine similarity over MiniLM
+vectors via ChromaDB). Skipped deliberately: queries here are conceptual
+("AI chip risk") not lexical lookups, the corpus is small (dense top-k
+already performs well at this scale), and hybrid fusion adds engineering
+surface area without contributing to any of the graded agent behaviours.
+See "Why dense embeddings only" in section 7.
 
 **Q: What is the ReAct pattern?**
 Reason + Act loop. The LLM reasons about which tool to call, executes it via
@@ -1138,3 +1233,152 @@ on smaller models.
 There is no official NVIDIA news API. `feedparser` parses RSS feeds that NVIDIA
 publishes publicly — no auth key required, which satisfies the assignment's
 keyless data source requirement.
+
+---
+
+## 9. Oral Exam — "What If" Questions (Theory Only, Not Implemented)
+
+These are extension questions an examiner might ask to probe understanding
+beyond what's actually built. None of this is implemented in the codebase —
+it's the reasoned answer for *how you would do it*, citing the real
+extension points that already exist in the architecture.
+
+### Q: How would you add another data source?
+
+The collector layer is already designed for this — adding a source touches
+**zero** LangGraph/pipeline code:
+
+1. Write a new module under `src/collectors/` (e.g. `reddit.py` or
+   `sec_filings.py`) with a `collect(cfg) -> list[Document]` function that
+   returns documents in the canonical shape defined in `src/schema.py`
+   (`id`, `title`, `text`, `url`, `source`, `published_at`, ...).
+2. Register it in `src/collectors/registry.py` — `collect_all(cfg)` just
+   loops over every registered collector and concatenates the results, so a
+   4th source is one more entry in that loop.
+3. Add an `enabled: true` block for it under `config.yaml`'s `sources:`
+   section (API params, rate limits, query terms).
+
+Nothing downstream needs to know a new source exists: `process_node` cleans
+and dedupes by content, not by source; `index_node` chunks and embeds
+whatever documents arrive; `intelligence_node` retrieves by meaning, not by
+source name. The schema is the contract — any collector that emits
+schema-conformant `Document` dicts plugs straight into `collect_node`
+(`pipeline/graph.py:63`). Near-dedup (`src/processing/deduplicator.py`)
+already handles a new source reporting the same story another source
+already covered.
+
+Good candidate next sources: SEC EDGAR filings (10-K/10-Q/8-K — structured,
+keyless), an earnings-call transcript feed, or a second RSS aggregator for
+redundancy.
+
+### Q: Could Graph 1 and Graph 2 be one graph instead of two?
+
+Yes, technically — LangGraph doesn't force the split; it was a **design
+choice**, not a constraint. Two ways it could be unified:
+
+1. **Subgraph composition.** LangGraph lets a compiled graph be embedded as
+   a single node inside another `StateGraph`. Graph 2 (`build_react_agent()`
+   in `src/agent/react_agent.py`) could be compiled and added as one node
+   inside Graph 1's builder, e.g. `g.add_node("advise", compiled_react_agent)`,
+   with a conditional edge after `brief` that routes into it only when a
+   pending question exists.
+2. **One unified schema with mixed reducers.** A single `TypedDict` can mix
+   plain (`LastValue`/overwrite) fields and `Annotated[list, add_messages]`
+   fields in the same schema — LangGraph applies the reducer per key, not
+   per graph. So a combined `UnifiedState` could hold both the pipeline's
+   `cfg/docs/processed/...` fields *and* a `messages` field with the append
+   reducer, all in one `StateGraph`.
+
+**Why it wasn't done this way:** Graph 1 is an offline batch job (run once,
+expensive — collection, embedding, three LLM passes) and Graph 2 is a live,
+cheap, per-question interaction. Merging them means every "Ask" click would
+either re-run the whole expensive pipeline (wasteful) or require the kind
+of conditional skip-routing described in the next answer to bypass the
+heavy nodes. Keeping them separate keeps each graph's purpose, state shape,
+and trigger (cron/manual vs. per-click) honest and simple — the two-graph
+split is a clarity/cost trade-off, not a LangGraph limitation.
+
+### Q: What is the architecture of Qwen3 (the generative LLM)?
+
+Qwen3-8B is a **decoder-only, autoregressive transformer** (GPT-family
+architecture, not an encoder like RoBERTa). Its publicly documented design:
+
+- **Causal self-attention** — predicts each next token conditioned only on
+  previous tokens (masked attention), same family as GPT/Llama/Mistral.
+- **Grouped Query Attention (GQA)** — fewer key/value attention heads than
+  query heads, shrinking the KV cache so inference is cheaper at long
+  context lengths.
+- **RoPE (Rotary Positional Embeddings)** — encodes token position by
+  rotating query/key vectors rather than adding a separate position vector;
+  generalises better to longer sequences than learned absolute positions.
+- **RMSNorm, pre-normalisation** — normalises before each sub-layer (not
+  after, as in the original Transformer), which stabilises training of
+  deep stacks; cheaper than LayerNorm (no mean-centering).
+- **SwiGLU activation** in the feed-forward blocks — a gated linear unit
+  variant, standard in modern LLMs (Llama 2/3, Mistral, Qwen) because it
+  outperforms plain ReLU/GELU MLPs at the same parameter budget.
+- **8B = parameter count, dense (not Mixture-of-Experts)** — the Qwen3
+  family also ships MoE variants (e.g. 30B-A3B), but Qwen3-8B activates
+  all 8B parameters on every token; no routing/expert-selection layer.
+- **Large multilingual tokenizer** (~150K vocabulary) and native long
+  context (32K, extendable).
+- **Thinking / non-thinking hybrid mode** — a Qwen3-specific feature: the
+  same model can be toggled between a slower chain-of-thought "thinking"
+  mode and a fast direct-answer mode, useful for trading latency against
+  reasoning depth per call.
+- **Tool-calling fine-tuning** — Qwen3 is instruction- and tool-call-tuned,
+  which is what `vllm serve ... --enable-auto-tool-choice
+  --tool-call-parser hermes` relies on: the model emits structured
+  Hermes-format tool-call JSON that `ChatOpenAI.bind_tools()` /
+  `ToolNode` parse in Graph 2.
+
+In this project's terms: Qwen3 is the **decoder/generation** half of the
+architecture (writes recommendations, briefings, ReAct reasoning);
+RoBERTa is the **encoder/understanding** half (classifies sentiment).
+Showing both in one project demonstrates you understand when each
+architecture family is the right tool (see "Why an encoder (RoBERTa) for
+sentiment, not the LLM?" in section 7).
+
+### Q: Instead of running every step in between, could you jump straight between processes?
+
+Yes — this is exactly what **conditional edges** are for, and Graph 2
+already does it (`should_continue` jumps straight to `END`, skipping `act`
+entirely, whenever there's no tool call). LangGraph edges are just entries
+in a directed graph; nothing requires a routing function to point at "the
+next node in sequence" — it can point anywhere, including several steps
+ahead or back to an earlier node.
+
+For Graph 1 (currently strictly linear), the same mechanism could skip the
+expensive early stages:
+
+```python
+def check_freshness(state: PipelineState) -> str:
+    # e.g. compare a stored timestamp / sentinel file to "now"
+    return "fresh" if kb_is_recent(state["cfg"]) else "stale"
+
+g.add_conditional_edges(
+    "check_freshness", check_freshness,
+    {"fresh": "intelligence", "stale": "collect"},   # jump straight past collect/process/index
+)
+```
+
+This would let a dashboard "Ask" click skip `collect → process → index`
+entirely when the knowledge base was refreshed recently, going straight to
+`intelligence` (or even straight into Graph 2) instead of re-running the
+whole pipeline — directly solving the "every interaction shouldn't re-run
+everything" problem raised by the previous question about merging the two
+graphs.
+
+Newer LangGraph versions also support `Command(goto=..., update=...)` —
+a node can return both a state update *and* explicitly name which node to
+jump to next, giving per-node dynamic routing without a separate
+conditional-edge function at all.
+
+**The caveat to mention if asked:** skipping nodes means the keys those
+nodes would have written (e.g. `processed`, `intelligence`) are *not*
+recomputed that run — downstream nodes must be written to tolerate reusing
+last run's value (e.g. reloading the last `intelligence.json` artifact)
+rather than assuming every key is always freshly computed. That's a real
+design cost of non-linear graphs, not a hidden gotcha — it's the same
+reasoning that explains why Graph 1 today is intentionally a simple,
+always-recompute-everything linear chain.
