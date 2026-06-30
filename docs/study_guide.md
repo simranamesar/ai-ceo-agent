@@ -272,6 +272,341 @@ appended, not replaced).
 
 ---
 
+### 2.9.1 LangGraph internals — how state actually flows (deep dive)
+
+This section answers the question precisely: **when** does a node have
+access to information, **what** does it actually see, and **how** does
+execution move from node to node under the hood?
+
+#### The mental model: channels + super-steps (Pregel/BSP)
+
+LangGraph is internally an implementation of the **Pregel** model (the same
+"bulk synchronous parallel" graph-processing model Google built for
+large-scale graph algorithms — message-passing nodes, executed in lockstep
+rounds called *super-steps*). Forget "function calls a function" — think of
+it as:
+
+1. Every field of your state schema (`PipelineState`, `MessagesState`) becomes
+   a **channel** — a named slot of memory with a type and an **update rule
+   (reducer)**.
+2. Execution proceeds in **super-steps**. In each super-step, LangGraph
+   determines which nodes are "active" (have new input pending), runs *all*
+   of them, collects what each one returns, and writes those returns into
+   the channels using each channel's reducer. Only then does it compute the
+   next active set and start the next super-step.
+3. A node never talks to another node directly. It reads channels (the state
+   dict), and writes channels (the dict it returns). The graph topology
+   (edges) just decides *which* node becomes active next — it carries no data
+   itself.
+
+This is why a node signature is always `def node_fn(state: SomeState) -> dict`
+— `state` is "read the channels," the returned dict is "write some channels."
+
+#### Channels and reducers — the part people miss
+
+By default, a key in a `TypedDict` state schema gets the **`LastValue`
+reducer**: whatever a node returns for that key *overwrites* the previous
+value. This is what `PipelineState` uses for every field — there is no
+`Annotated[...]` on any of them in [pipeline/graph.py](pipeline/graph.py):
+
+```python
+class PipelineState(TypedDict):
+    cfg: dict[str, Any]
+    docs: list[dict]
+    processed: list[dict]
+    intelligence: dict[str, Any]
+    ...
+```
+
+So when `process_node` returns `{"processed": deduped}`, LangGraph does not
+merge or append — it replaces whatever `state["processed"]` held before
+(nothing, on the first run) with `deduped`. Returning `{}` (as `index_node`
+does) changes nothing; that node's only job is the ChromaDB side effect.
+
+`MessagesState` ([src/agent/react_agent.py](../src/agent/react_agent.py))
+is different: it is a **pre-built schema** equivalent to
+`{"messages": Annotated[list[BaseMessage], add_messages]}`. The
+`add_messages` reducer does *not* overwrite the list — it **appends** the
+new messages to the existing list (and replaces a message in place if its
+`id` already exists, which supports streaming token updates). That single
+annotation is the entire reason the ReAct loop accumulates a growing
+conversation instead of each turn wiping out the last one. Without it, every
+`return {"messages": [response]}` would erase the whole history.
+
+#### Building the graph (compile-time, not run-time)
+
+```python
+g = StateGraph(PipelineState)
+for name, fn in nodes:
+    g.add_node(name, fn)          # registers a channel "writer" function
+g.set_entry_point("collect")      # which node activates at super-step 0
+for (a, _), (b, _) in zip(nodes, nodes[1:]):
+    g.add_edge(a, b)              # static: a finishing always activates b
+g.add_edge("brief", END)
+pipeline = g.compile()            # validates graph, returns a runnable
+```
+
+`g.compile()` checks every edge references a real node, that `END` is
+reachable, and turns the builder into a `Pregel` instance (the
+`CompiledStateGraph` object) with `.invoke()`, `.stream()`, `.ainvoke()`.
+**No node code has run yet** — compiling only builds the topology.
+
+Graph 2 additionally uses a **conditional edge**:
+
+```python
+g.add_conditional_edges("reason", should_continue, {"act": "act", END: END})
+g.add_edge("act", "reason")
+```
+
+`should_continue` is a plain Python function that receives the state
+*after* `reason` just ran, and returns a string key. LangGraph looks that
+key up in the `{"act": "act", END: END}` mapping to decide what activates
+next. This is the mechanism behind "the LLM decides" — the routing function
+itself does nothing clever, it just reads `state["messages"][-1].tool_calls`;
+the *intelligence* lives entirely in what the LLM chose to put in that last
+message during the `reason` node.
+
+#### Execution, step by step
+
+Call `pipeline.invoke(initial_state_dict)`. This is what actually happens:
+
+1. **Super-step 0 — seed.** The dict you pass to `invoke()` is written into
+   every channel it touches. In `main()` ([pipeline/graph.py:201-213](../pipeline/graph.py)),
+   this seeds `cfg`, `embedder`, `llm`, and empty placeholders for
+   everything not yet computed. The entry-point node (`collect`) becomes
+   the active set.
+2. **Run the active node(s).** `collect_node(state)` is called with the
+   *entire* current state dict — even keys it doesn't use (`intelligence`,
+   `sentiment`, still empty) are present and readable. It returns
+   `{"docs": docs}`.
+3. **Apply reducers.** LangGraph takes `{"docs": docs}` and writes it into
+   the `docs` channel via `LastValue` (overwrite). The shared state object
+   now has real `docs`.
+4. **Compute the next active set from edges.** `collect → process` is a
+   static edge, so `process` becomes active for super-step 1.
+5. **Repeat.** `process_node` receives the state *as it now stands* —
+   including the `docs` that `collect_node` just wrote in the previous
+   super-step. It reads `state["docs"]`, returns `{"processed": deduped}`.
+   And so on through `index → intelligence → sentiment → recommend →
+   verify → brief`.
+6. **Termination.** When the active node's outgoing edge points at `END`
+   (`brief → END`), there is no next active set, and `invoke()` returns the
+   final accumulated state dict — every channel as it stood after the last
+   write to it.
+
+The critical point, answering "when does the StateGraph have info": **a
+node always sees the full state as accumulated by every super-step that
+ran before it — not just what the immediately preceding node returned.**
+By the time `verify_node` runs, `state` already contains `cfg`, `embedder`,
+`llm`, `docs`, `processed`, `intelligence`, `sentiment`, and
+`recommendations` — five super-steps' worth of writes, all still present
+because nothing overwrote them. `verify_node` only touches
+`recommendations` and `verification`; everything else just rides along
+unchanged in the dict.
+
+#### Worked example — state growth across Graph 1's super-steps
+
+| Super-step | Node that runs | Reads | Writes (returns) | State after this step |
+|---|---|---|---|---|
+| 0 (seed) | — | — | `cfg, embedder, llm` (+ empty placeholders) | `cfg, embedder, llm` only |
+| 1 | `collect` | `cfg` | `{"docs": [...]}` | + `docs` |
+| 2 | `process` | `cfg, embedder, docs` | `{"processed": [...]}` | + `processed` |
+| 3 | `index` | `cfg, embedder, processed` | `{}` (side effect only) | unchanged |
+| 4 | `intelligence` | `cfg, embedder, llm, processed` | `{"intelligence": {...}}` | + `intelligence` |
+| 5 | `sentiment` | `cfg, processed` | `{"sentiment": {...}}` | + `sentiment` |
+| 6 | `recommend` | `cfg, llm, intelligence` | `{"recommendations": [...]}` | + `recommendations` |
+| 7 | `verify` | `cfg, embedder, recommendations` | `{"recommendations": [...], "verification": {...}}` | `recommendations` overwritten with verified-only list, + `verification` |
+| 8 | `brief` | `cfg, llm, intelligence, recommendations` | `{"briefing": {...}}` | + `briefing` → returned by `invoke()` |
+
+Because Graph 1 is a strict chain (one active node per super-step, no
+branching, no parallel writers), there is never a conflict over who writes
+a channel first — `LastValue` overwrite semantics are sufficient and safe.
+
+#### Worked example — Graph 2's loop and the message list
+
+```
+invoke({"messages": [HumanMessage("What's our biggest AI risk?")]})
+
+super-step 0 (seed):     messages = [Human]
+super-step 1 (reason):   reads messages=[Human]
+                          LLM emits AIMessage(tool_calls=[search_kb])
+                          returns {"messages": [AIMessage]}
+                          add_messages APPENDS → messages = [Human, AI(tool_call)]
+                          should_continue(state) sees tool_calls → routes to "act"
+super-step 2 (act):      ToolNode executes search_kb(...), wraps result as ToolMessage
+                          returns {"messages": [ToolMessage]}
+                          add_messages APPENDS → messages = [Human, AI(tool_call), Tool]
+                          static edge act → reason
+super-step 3 (reason):   reads the FULL messages list so far (all 3 messages)
+                          LLM sees the tool result, decides: enough evidence → emits
+                          a plain AIMessage with NO tool_calls
+                          returns {"messages": [AIMessage(final)]}
+                          add_messages APPENDS → messages = [Human, AI(tc), Tool, AI(final)]
+                          should_continue(state) sees no tool_calls → routes to END
+invoke() returns:        {"messages": [Human, AI(tc), Tool, AI(final)]}
+```
+
+Three things this makes concrete:
+- **`reason` is called multiple times** (once per loop iteration) — each
+  call is a fresh super-step, but it always reads the *cumulative* message
+  list, which is exactly why the LLM "remembers" the tool result it just
+  received: that `ToolMessage` is already sitting in `state["messages"]`
+  before the next `reason` call starts.
+- **The loop is just repeated graph traversal**, not a special LangGraph
+  looping construct — `act → reason` is a normal static edge, and
+  `reason`'s conditional edge re-enters `act` for as many iterations as the
+  LLM keeps requesting tools (capped at `MAX_TOOL_CALLS = 8` inside `reason`
+  itself, since LangGraph has no built-in step limit here).
+- **`add_messages` is what prevents data loss.** If `MessagesState` used the
+  default `LastValue` reducer instead, `super-step 2`'s
+  `{"messages": [ToolMessage]}` would *replace* the whole list with a
+  single `ToolMessage`, erasing the `HumanMessage` and the tool-call
+  `AIMessage` — the agent would lose all prior context every turn.
+
+#### Summary — direct answers
+
+- **How does the StateGraph have info?** Every node's return value (a
+  partial dict) is merged into a single shared state object using a
+  per-key reducer (`LastValue`/overwrite by default, `add_messages`/append
+  when annotated). The graph itself stores nothing else — it's purely the
+  channel values plus whichever node is currently active.
+- **When does a node have info?** At the moment it is invoked for a given
+  super-step, it receives the state exactly as it stood after every prior
+  super-step's writes were applied — never partial, never stale within a
+  single linear path.
+- **How does the flow run?** `compile()` builds a static graph of channels
+  + edges once. `invoke()` then drives it through Pregel-style super-steps:
+  seed → run active node(s) → reduce their outputs into channels →
+  recompute the active set from edges (static or conditional) → repeat
+  until the active set is empty (`END` reached).
+
+#### 2.9.2 Diagram — StateGraph + memory, with the exact code file for each step
+
+**Graph 1 — `pipeline/graph.py`: linear chain, overwrite memory**
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1. SCHEMA — the shape of memory                                       │
+│    class PipelineState(TypedDict): cfg, embedder, llm, docs, ...      │
+│    pipeline/graph.py : lines 46-56                                    │
+│    No Annotated[] on any field → every channel uses the default       │
+│    LastValue (overwrite) reducer.                                     │
+└────────────────────────────────┬───────────────────────────────────-─┘
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2. BUILD — compile-time only, nothing runs yet                        │
+│    g = StateGraph(PipelineState)            pipeline/graph.py : 168   │
+│    g.add_node("collect", collect_node) ...  pipeline/graph.py : 171-181 (x8)│
+│    g.set_entry_point("collect")             pipeline/graph.py : 183   │
+│    g.add_edge(a, b)   (static, linear)      pipeline/graph.py : 184-186│
+│    pipeline = g.compile()                   pipeline/graph.py : 188   │
+└────────────────────────────────┬────────────────────────────────────┘
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3. SEED MEMORY — super-step 0                                         │
+│    pipeline.invoke({cfg, embedder, llm, docs:[], processed:[], ...})  │
+│    pipeline/graph.py : 201-213  (inside main())                       │
+└────────────────────────────────┬────────────────────────────────────┘
+                                  ▼
+   ╔════════════════════════ MEMORY (in-process dict, lives only for ════════════════════════╗
+   ║                          the duration of this one .invoke() call)                        ║
+   ║  cfg, embedder, llm ─── present from super-step 0, read by every later node              ║
+   ║  docs           ← written super-step 1                                                   ║
+   ║  processed      ← written super-step 2                                                   ║
+   ║  intelligence   ← written super-step 4                                                   ║
+   ║  sentiment      ← written super-step 5                                                   ║
+   ║  recommendations← written super-step 6, OVERWRITTEN super-step 7 (verified-only list)    ║
+   ║  verification   ← written super-step 7                                                   ║
+   ║  briefing       ← written super-step 8                                                   ║
+   ╚════════════════════════════════════════════════════════════════════════════════════════╝
+            │ each super-step: node reads memory → returns partial dict →
+            │ LangGraph applies LastValue (overwrite) reducer back into memory
+            ▼
+  collect → process → index → intelligence → sentiment → recommend → verify → brief → END
+  (node functions, in order, all in pipeline/graph.py : 63-159)
+   collect_node:63   process_node:72   index_node:87   intelligence_node:99
+   sentiment_node:113   recommend_node:123   verify_node:130   brief_node:153
+            │
+            ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4. FINAL MEMORY returned to caller                                     │
+│    final = pipeline.invoke(...)             pipeline/graph.py : 201   │
+│    final["recommendations"], final["briefing"] etc. → print_report()  │
+│    (src/report.py); each node also persists its own slice to          │
+│    data/outputs/*.json as a side effect along the way.                │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Graph 2 — `src/agent/react_agent.py`: looping chain, append-only memory**
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1. SCHEMA — built-in MessagesState                                    │
+│    {"messages": Annotated[list[BaseMessage], add_messages]}           │
+│    imported from langgraph.graph         react_agent.py : 25          │
+│    add_messages reducer = APPEND (and replace-by-id), not overwrite   │
+└────────────────────────────────┬───────────────────────────────────-─┘
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2. BUILD                                                                │
+│    g = StateGraph(MessagesState)                  react_agent.py : 102 │
+│    g.add_node("reason", reason)                   react_agent.py : 103 │
+│    g.add_node("act", ToolNode(tools))              react_agent.py : 100,104│
+│    g.set_entry_point("reason")                     react_agent.py : 105│
+│    g.add_conditional_edges("reason", should_continue,                  │
+│         {"act": "act", END: END})                  react_agent.py : 106│
+│    g.add_edge("act", "reason")                      react_agent.py : 107│
+│    agent = g.compile()                              react_agent.py : 108│
+└────────────────────────────────┬────────────────────────────────────┘
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3. SEED MEMORY — super-step 0                                          │
+│    agent.invoke({"messages": [HumanMessage(question)]})                │
+│    react_agent.py : 127  (inside run_react_agent())                    │
+└────────────────────────────────┬────────────────────────────────────┘
+                                  ▼
+  MEMORY = messages: [Human]
+       │
+       ▼  super-step 1 — reason()              react_agent.py : 69-91
+       │     reads messages, calls llm_with_tools.invoke(messages)
+       │     returns {"messages": [AIMessage(tool_calls=...)]}
+       │     add_messages APPENDS → messages: [Human, AI(tc)]
+       │     should_continue()  react_agent.py : 94-98  sees tool_calls → "act"
+       ▼
+  super-step 2 — act = ToolNode(tools)         react_agent.py : 100,104
+       │     executes the chosen tool          src/tools/registry.py
+       │     returns {"messages": [ToolMessage(result)]}
+       │     add_messages APPENDS → messages: [Human, AI(tc), Tool]
+       │     static edge "act" → "reason"      react_agent.py : 107
+       ▼
+  super-step 3 — reason() again
+       │     reads ALL prior messages (full memory, not just the last one)
+       │     LLM has enough evidence now → AIMessage with NO tool_calls
+       │     returns {"messages": [AIMessage(final)]}
+       │     add_messages APPENDS → messages: [Human, AI(tc), Tool, AI(final)]
+       │     should_continue() sees no tool_calls → END
+       ▼
+  agent.invoke() returns final memory:
+  messages = [Human, AI(tool_call), Tool(result), AI(final answer)]
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4. run_react_agent()  react_agent.py : 115-149                         │
+│    walks the final messages list, extracts the last plain-text         │
+│    AIMessage as `answer`, and every tool_call as a `tool_trace` entry  │
+└────────────────────────────────┬────────────────────────────────────┘
+                                  ▼
+            dashboard/app.py — "Ask" button renders answer + tool trace
+```
+
+The two diagrams make the contrast explicit: Graph 1's memory is a **flat
+dict where each key is written once** (linear pipeline, overwrite reducer);
+Graph 2's memory is a **single growing list** where every super-step adds
+to it (loop, append reducer) — that accumulation is what gives the ReAct
+agent something resembling short-term memory across reasoning turns.
+
+---
+
 ### 2.10 ReAct Pattern — Reason + Act
 
 **The pattern:** Instead of asking the LLM to answer directly, you give it
@@ -736,6 +1071,24 @@ distance 1 = completely unrelated.
 **Q: Why is the near-dedup threshold 0.92?**
 High enough to catch paraphrased articles (same story, rewritten) but low enough
 to keep articles about the same company that describe different events.
+
+**Q: How does LangGraph's StateGraph actually hold and pass state?**
+Every field of the state schema is a "channel." A node receives the full
+current state dict, returns only the keys it changed, and LangGraph writes
+those into the channels using a reducer — `LastValue` (overwrite) by default,
+or `add_messages` (append) when the field is `Annotated[list, add_messages]`
+like `MessagesState.messages`. Execution proceeds in Pregel-style "super-steps":
+run the active node(s) → reduce their outputs into channels → use the edges
+(static or conditional) to pick the next active node(s) → repeat until `END`.
+A node always sees everything every prior super-step wrote, not just what the
+immediately preceding node returned. See 2.9.1 for the full worked walkthrough.
+
+**Q: Why doesn't returning `{"messages": [response]}` in Graph 2 erase the
+previous conversation?**
+Because `MessagesState.messages` is `Annotated[list[BaseMessage], add_messages]`
+— its reducer appends rather than overwrites. `PipelineState` fields have no
+such annotation, so they use the default overwrite reducer instead (fine
+there, since Graph 1 is a strict linear chain with one writer per channel).
 
 **Q: What is the ReAct pattern?**
 Reason + Act loop. The LLM reasons about which tool to call, executes it via
